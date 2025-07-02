@@ -8,12 +8,15 @@ from langchain.chat_models import init_chat_model
 from langchain_tavily import TavilySearch
 from langchain_community.tools import BraveSearch
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage,AIMessageChunk
 from langgraph.prebuilt import ToolNode,tools_condition
 import json
 from langgraph.graph.message import add_messages
 import requests
 import asyncio
+from fastapi import FastAPI,Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 load_dotenv()
 
 class State(TypedDict):
@@ -44,6 +47,7 @@ async def chat_node(state: State):
     return {
         "messages": [message]
     }
+
 async def tools_router(state: State):
     last_message = state["messages"][-1]
     if(hasattr(last_message,"tool_calls") and len(last_message.tool_calls) > 0):
@@ -92,31 +96,106 @@ graph_builder.add_node("tools",tool_node)
 graph_builder.add_edge(START, "chat_node")
 graph_builder.add_conditional_edges("chat_node",tools_condition)
 graph_builder.add_edge("tools", "chat_node")
+graph = graph_builder.compile(checkpointer=memory)
+app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Type"],
+)
 
-async def main():
-    while True:
-        graph = graph_builder.compile(checkpointer=memory)
+def serialize_ai_message_chunk(chunk):
+    if(isinstance(chunk,AIMessageChunk)):
+        return chunk.content
+    else:
+        raise TypeError(
+            f"Expected AIMessageChunk, got {type(chunk)}"
+        )
+async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Query(None)):
+    is_new_conversation = checkpoint_id is None
+    if is_new_conversation:
+        new_checkpoint_id = str(uuid4())
         config =  {
             "configurable":{
-                "thread_id":1
+                "thread_id": new_checkpoint_id
             }
         }
-        query = input("Enter your query: ")
         _state = {
             "messages": [
-                {"role": "user", "content": query}
+                {"role": "user", "content": message}
             ]
         }
-        # result = asyncio.run(graph.ainvoke(_state, config=config))
-        # print(result)
         events = graph.astream_events(
             _state,
             config=config,
             version="v2"
         )
-        async for event in events:
-            if event["event"] == "on_chat_model_stream":
-                print(event["data"]["chunk"].content,end='', flush=True)
-            
-asyncio.run(main())
+        yield f"data:{{\"type\":\"checkpoint_id\",\"data\":\"{new_checkpoint_id}\"}}\n\n"
+    
+    else:
+        config =  {
+            "configurable":{
+                "thread_id": checkpoint_id
+            }
+        }
+        _state = {
+            "messages": [
+                {"role": "user", "content": message}
+            ]
+        }
+        events = graph.astream_events(
+            _state,
+            config=config,
+            version="v2"
+        )
+
+    async for event in events:
+        event_type = event["event"]
+
+        if event_type == "on_chat_model_stream":
+            chunk_content = serialize_ai_message_chunk(event["data"]["chunk"])
+            safe_content = chunk_content.replace("'", "\\'").replace("\n", "\\n")
+            yield f"data:{{\"type\":\"chunk\",\"data\":\"{safe_content}\"}}\n\n"
+        
+        elif event_type == "on_chat_model_end":
+            tool_calls = event["data"]["output"].tool_calls if hasattr(event["data"]["output"], "tool_calls") else []
+            search_calls = [call for call in tool_calls if call["name"] == "search"]
+            weather_calls = [call for call in tool_calls if call["name"] == "get_weather"]
+
+            if search_calls:
+                search_query = search_calls[0]["args"].get("query", "")
+                safe_query = search_query.replace("'", "\\'").replace("\n", "\\n")
+                yield f"data:{{\"type\":\"search\",\"data\":\"{safe_query}\"}}\n\n"
+            if weather_calls:
+                weather_city = weather_calls[0]["args"].get("city", "")
+                safe_city = weather_city.replace("'", "\\'").replace("\n", "\\n")
+                yield f"data:{{\"type\":\"weather\",\"data\":\"{safe_city}\"}}\n\n"
+        
+        elif event_type == "on_tool_end" and event["name"] == "search":
+            output = event["data"]["output"]
+            if isinstance(output, list):
+                urls = []
+                for item in output:
+                    if isinstance(item, dict) and "url" in item:
+                        urls.append(item["url"])
+                urls_json = json.dumps(urls)
+                yield f"data:{{\"type\":\"search_results\",\"data\":{urls_json}}}\n\n"
+        
+        
+    yield f"data:{{\"type\":\"end\"}}\n\n"
+
+
+@app.get("/chat_stream/{message}")
+async def chat_stream(message: str,checkpoint_id:Optional[str]=Query(None)):
+    #SSE - Server-Sent Events
+    # why ? because we want to stream the response from the server to the client
+    # we can hv used WebSockets,but it can be overkill for this use case
+    # we want to stream the response from the server to the client
+    return StreamingResponse(
+        generate_chat_response(message,checkpoint_id),
+        media_type="text/event-stream"
+    )
