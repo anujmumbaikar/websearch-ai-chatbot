@@ -8,7 +8,7 @@ from langchain.chat_models import init_chat_model
 from langchain_tavily import TavilySearch
 from langchain_community.tools import BraveSearch
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage,AIMessageChunk
+from langchain_core.messages import ToolMessage,AIMessageChunk,HumanMessage
 from langgraph.prebuilt import ToolNode,tools_condition
 import json
 from langgraph.graph.message import add_messages
@@ -36,7 +36,7 @@ def search(query: str):
     """This tool searches the web for the given query"""
     search = TavilySearch(max_results=5)
     results = search.invoke(query)
-    return "Results:" + json.dumps(results, indent=2)
+    return results
 
 tools=[get_weather,search] 
 llm = init_chat_model( model_provider="openai", model="gpt-4.1-mini")
@@ -86,8 +86,6 @@ async def tool_node(state: State):
         "messages": tool_messages
     }
 
-
-
 memory = MemorySaver()
 graph_builder = StateGraph(State)
 graph_builder.add_node("chat_node", chat_node)
@@ -108,12 +106,12 @@ app.add_middleware(
     expose_headers=["Content-Type"],
 )
 
-def serialize_ai_message_chunk(chunk):
-    if(isinstance(chunk,AIMessageChunk)):
+def serialise_ai_message_chunk(chunk): 
+    if(isinstance(chunk, AIMessageChunk)):
         return chunk.content
     else:
         raise TypeError(
-            f"Expected AIMessageChunk, got {type(chunk)}"
+            f"Object of type {type(chunk).__name__} is not correctly formatted for serialisation"
         )
 async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Query(None)):
     is_new_conversation = checkpoint_id is None
@@ -126,7 +124,7 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
         }
         _state = {
             "messages": [
-                {"role": "user", "content": message}
+                HumanMessage(content=message)
             ]
         }
         events = graph.astream_events(
@@ -134,7 +132,7 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
             config=config,
             version="v2"
         )
-        yield f"data:{{\"type\":\"checkpoint_id\",\"data\":\"{new_checkpoint_id}\"}}\n\n"
+        yield f"data: {{\"type\": \"checkpoint\", \"checkpoint_id\": \"{new_checkpoint_id}\"}}\n\n"
     
     else:
         config =  {
@@ -144,7 +142,7 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
         }
         _state = {
             "messages": [
-                {"role": "user", "content": message}
+                HumanMessage(content=message)
             ]
         }
         events = graph.astream_events(
@@ -157,9 +155,11 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
         event_type = event["event"]
 
         if event_type == "on_chat_model_stream":
-            chunk_content = serialize_ai_message_chunk(event["data"]["chunk"])
+            chunk_content = serialise_ai_message_chunk(event["data"]["chunk"])
+            # Escape single quotes and newlines for safe JSON parsing
             safe_content = chunk_content.replace("'", "\\'").replace("\n", "\\n")
-            yield f"data:{{\"type\":\"chunk\",\"data\":\"{safe_content}\"}}\n\n"
+            
+            yield f"data: {{\"type\": \"content\", \"content\": \"{safe_content}\"}}\n\n"
         
         elif event_type == "on_chat_model_end":
             tool_calls = event["data"]["output"].tool_calls if hasattr(event["data"]["output"], "tool_calls") else []
@@ -168,8 +168,9 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
 
             if search_calls:
                 search_query = search_calls[0]["args"].get("query", "")
-                safe_query = search_query.replace("'", "\\'").replace("\n", "\\n")
-                yield f"data:{{\"type\":\"search\",\"data\":\"{safe_query}\"}}\n\n"
+                safe_query = search_query.replace('"', '\\"').replace("'", "\\'").replace("\n", "\\n")
+                yield f"data: {{\"type\": \"search_start\", \"query\": \"{safe_query}\"}}\n\n"
+
             if weather_calls:
                 weather_city = weather_calls[0]["args"].get("city", "")
                 safe_city = weather_city.replace("'", "\\'").replace("\n", "\\n")
@@ -177,16 +178,17 @@ async def generate_chat_response(message: str, checkpoint_id: Optional[str] = Qu
         
         elif event_type == "on_tool_end" and event["name"] == "search":
             output = event["data"]["output"]
+            
             if isinstance(output, list):
                 urls = []
                 for item in output:
                     if isinstance(item, dict) and "url" in item:
                         urls.append(item["url"])
+                
                 urls_json = json.dumps(urls)
-                yield f"data:{{\"type\":\"search_results\",\"data\":{urls_json}}}\n\n"
+                yield f"data: {{\"type\": \"search_results\", \"urls\": {urls_json}}}\n\n"
         
-        
-    yield f"data:{{\"type\":\"end\"}}\n\n"
+    yield f"data: {{\"type\": \"end\"}}\n\n"
 
 
 @app.get("/chat_stream/{message}")
