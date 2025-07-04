@@ -96,7 +96,7 @@ graph_builder.add_node("chat_node", chat_node)
 graph_builder.add_node("tools", tool_node)
 
 graph_builder.add_edge(START, "chat_node")
-graph_builder.add_conditional_edges("chat_node", tools_router)  # ✅ fixed
+graph_builder.add_conditional_edges("chat_node", tools_router)
 graph_builder.add_edge("tools", "chat_node")
 graph = graph_builder.compile(checkpointer=memory)
 
